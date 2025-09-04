@@ -3,6 +3,7 @@ LangGraph + Ollama + SearXNG (hosted on Raspberry Pi)
 - Local LLM via Ollama (e.g., `mistral-nemo:12b`)
 - Web search tool via SearXNG JSON API
 - Tool-calling loop with LangGraph
+- Persistent chat memory via LangGraph checkpointer (InMemorySaver)
 
 Run:
   python add_tools_searxng_pi.py
@@ -25,6 +26,7 @@ from langchain_ollama import ChatOllama
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver  # <-- memory checkpointer
 
 # ========== Configuration ==========
 # Set your Pi host once; allow override via env var.
@@ -33,6 +35,9 @@ SEARXNG_HOST: str = os.getenv("SEARXNG_HOST", "http://192.168.68.63")
 SEARXNG_TIMEOUT_S: float = float(os.getenv("SEARXNG_TIMEOUT_S", "30"))
 DEFAULT_RESULTS: int = int(os.getenv("SEARXNG_RESULTS", "5"))
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "mistral-nemo:12b")
+
+# Memory / session
+THREAD_ID: str = os.getenv("THREAD_ID", "1")  # choose a different value to start a fresh thread
 
 # ========== State definition ==========
 class State(TypedDict):
@@ -163,21 +168,36 @@ graph_builder.add_conditional_edges(
 graph_builder.add_edge("tools", "chatbot")
 graph_builder.add_edge(START, "chatbot")
 
-graph = graph_builder.compile()
+# ----- Add memory (checkpointer) per tutorial -----
+memory = InMemorySaver()
+graph = graph_builder.compile(checkpointer=memory)  # <-- enable persistence
+# (In production, consider SqliteSaver/PostgresSaver; this in-memory saver resets when the process restarts.)
 
 # ========== Runner ==========
-def stream_graph_updates(user_input: str) -> None:
-    """Send a single user message and stream assistant updates as they occur."""
+def stream_graph_updates(user_input: str, thread_id: str) -> None:
+    """
+    Send a single user message and stream assistant updates as they occur.
+    Memory is keyed by `thread_id` via the config's configurable block.
+    """
     initial_state = {"messages": [{"role": "user", "content": user_input}]}
-    for event in graph.stream(initial_state):
-        for value in event.values():
-            print("Assistant:", value["messages"][-1].content)
+    config = {"configurable": {"thread_id": thread_id}}  # <-- critical for memory
+    # Using stream_mode="values" to yield only the state values (simpler to print)
+    for event in graph.stream(initial_state, config, stream_mode="values"):
+        # Each `event` is the current state values snapshot
+        print("Assistant:", event["messages"][-1].content)
 
 if __name__ == "__main__":
     print(f"[info] Using SearXNG at: {SEARXNG_HOST}")
     print(f"[info] Using Ollama model: {OLLAMA_MODEL}")
+    print(f"[info] Using THREAD_ID: {THREAD_ID}  (set env THREAD_ID to change session)")
+    print("[help] Type 'new:<id>' to switch to a new thread at any time (e.g., new:2).")
+    thread_id = THREAD_ID
     while True:
         q = input("User: ")
         if q.lower() in {"q", "quit", "exit"}:
             break
-        stream_graph_updates(q)
+        if q.lower().startswith("new:"):
+            thread_id = q.split(":", 1)[1].strip() or thread_id
+            print(f"[info] Switched to THREAD_ID={thread_id}")
+            continue
+        stream_graph_updates(q, thread_id)
